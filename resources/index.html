@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>安徽工程大学 - 高并发控制台</title>
+    <style>
+        /* 极其极简、现代的 CSS 样式 */
+        body {
+            margin: 0;
+            padding: 0;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #1e3c72 0%, #2a5298 100%);
+            height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            color: #333;
+        }
+
+        .login-box {
+            background: rgba(255, 255, 255, 0.95);
+            padding: 40px;
+            border-radius: 12px;
+            box-shadow: 0 15px 25px rgba(0, 0, 0, 0.2);
+            width: 320px;
+            text-align: center;
+        }
+
+        .login-box h2 {
+            margin-top: 0;
+            color: #1e3c72;
+            margin-bottom: 25px;
+        }
+
+        .input-group {
+            margin-bottom: 20px;
+            text-align: left;
+        }
+
+        .input-group label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+            font-size: 14px;
+        }
+
+        .input-group input {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #ccc;
+            border-radius: 6px;
+            box-sizing: border-box;
+            /* 防止边框撑破容器 */
+            font-size: 16px;
+        }
+
+        button {
+            width: 100%;
+            padding: 12px;
+            background-color: #2a5298;
+            color: white;
+            border: none;
+            border-radius: 6px;
+            font-size: 16px;
+            font-weight: bold;
+            cursor: pointer;
+            transition: background 0.3s;
+        }
+
+        button:hover {
+            background-color: #1e3c72;
+        }
+
+        #message-box {
+            margin-top: 20px;
+            font-weight: bold;
+            min-height: 20px;
+            /* 占位，防止文字出现时页面跳动 */
+        }
+
+        .success {
+            color: #28a745;
+        }
+
+        .error {
+            color: #dc3545;
+        }
+    </style>
+</head>
+
+<body>
+
+    <div class="login-box">
+        <h2>🛠️ Web Server 控制台</h2>
+
+        <div class="input-group">
+            <label for="username">账号</label>
+            <input type="text" id="username" placeholder="请输入管理员账号">
+        </div>
+
+        <div class="input-group">
+            <label for="password">密码</label>
+            <input type="password" id="password" placeholder="请输入密码">
+        </div>
+
+        <button onclick="doLogin()">登 录</button>
+
+        <div id="message-box"></div>
+    </div>
+
+    <script>
+        // ==============================================================
+        // 【核心交互逻辑】：用 Fetch API 替代传统的表单提交
+        // ==============================================================
+        function doLogin() {
+            // 1. 获取输入框里的账号和密码
+            const user = document.getElementById('username').value;
+            const pass = document.getElementById('password').value;
+            const msgBox = document.getElementById('message-box');
+
+            if (!user || !pass) {
+                msgBox.innerHTML = "<span class='error'>账号和密码不能为空！</span>";
+                return;
+            }
+
+            msgBox.innerHTML = "<span style='color:gray'>正在连接服务器...</span>";
+
+            // 2. 组装成 C++ 后端认识的格式 (user=xxx&password=yyy)
+            const payload = `user=${encodeURIComponent(user)}&password=${encodeURIComponent(pass)}`;
+
+            // 3. 向你的 C++ 服务器发送 POST 请求 (就跟刚才的 curl 一模一样！)
+            fetch('/login', {
+                method: 'POST',
+                headers: {
+                    // 告诉 C++ 服务器，发过去的是表单数据
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                },
+                body: payload
+            })
+                .then(response => response.json()) // 把 C++ 返回的纯文本解析成 JSON 对象
+                .then(data => {
+                    // 4. 根据 C++ 返回的 JSON 状态，动态修改网页内容！
+                    if (data.status === 'success') {
+                        msgBox.innerHTML = `<span class='success'>✅ ${data.message}</span>`;
+                        // 登录成功后，还可以加个页面跳转逻辑： window.location.href = "/dashboard.html";
+                    } else {
+                        msgBox.innerHTML = `<span class='error'>❌ ${data.message}</span>`;
+                    }
+                })
+                .catch(error => {
+                    msgBox.innerHTML = "<span class='error'>❌ 服务器连接异常，请检查 C++ 后台是否启动！</span>";
+                    console.error("Error:", error);
+                });
+        }
+    </script>
+</body>
+
+</html>
