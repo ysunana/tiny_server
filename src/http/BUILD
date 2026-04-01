@@ -7,4 +7,7 @@ cc_library(
         "//src/mysql:mysql_pool_lib", 
         "//src/log:log_lib",
     ],
+    linkopts = [
+        "-lhiredis", 
+    ],
 )

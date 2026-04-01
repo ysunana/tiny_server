@@ -49,7 +49,8 @@ private:
 // ##__VA_ARGS__ 是 C++ 的黑魔法，用来支持可变参数（就像 printf 一样）
 // =========================================================================
 #define LOG_DEBUG(format, ...) Log::Instance()->write(0, format, ##__VA_ARGS__)
-#define LOG_INFO(format, ...)  Log::Instance()->write(1, format, ##__VA_ARGS__)
+// #define LOG_INFO(format, ...)  Log::Instance()->write(1, format, ##__VA_ARGS__)
+#define LOG_INFO(format, ...) do {} while(0);
 #define LOG_WARN(format, ...)  Log::Instance()->write(2, format, ##__VA_ARGS__)
 #define LOG_ERROR(format, ...) Log::Instance()->write(3, format, ##__VA_ARGS__)
 
