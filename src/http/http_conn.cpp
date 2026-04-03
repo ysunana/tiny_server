@@ -5,25 +5,38 @@ http_conn::http_conn() {
     m_sockfd = -1; // -1 代表这个长工目前闲置，没有接待客人
     m_url = nullptr;
     m_post_data = nullptr;
+    m_file_address = nullptr;
     // 其他指针也置空即可，不需要在这里 memset，因为没人用
 }
 
 void http_conn::init(int fd) {
     m_sockfd = fd;
-    
-    // 1. 状态机归零
     m_check_state = REQUESTLINE;
     m_is_post = false;
     m_content_length = 0;
     m_is_keep_alive = false;
     
-    // 2. 指针和书签归零 (你之前漏掉的 m_read_idx 必须加在这！)
     m_read_idx = 0;
     m_url = nullptr;
     m_post_data = nullptr;
+    m_jwt_token = nullptr;
     
-    // 3. 极其暴力的物理洗脑（把上一个客人的残留数据彻底抹除）
+    // 重置发货记账本
+    m_write_idx = 0;
+    bytes_to_send = 0;
+    bytes_have_send = 0;
+    unmap(); // 清理上一任客人可能的残留
+    memset(m_write_buf, '\0', WRITE_BUFFER_SIZE);
+    
     memset(m_read_buf, '\0', READ_BUFFER_SIZE);
+}
+
+// 释放内存的专属函数
+void http_conn::unmap() {
+    if (m_file_address) {
+        munmap(m_file_address, m_file_size);
+        m_file_address = nullptr;
+    }
 }
 
 // 切割一行的工具函数
@@ -62,7 +75,7 @@ const char* get_content_type(const char* name) {
 
 void http_conn::process() {
     // ==========================================
-    // 🔪 第一刀：彻底抽干内核缓冲区 (ET 模式铁律)
+    // 第一刀：彻底抽干内核缓冲区 (ET 模式铁律)
     // ==========================================
     
     while (true) {
@@ -71,7 +84,7 @@ void http_conn::process() {
         
         if (bytes_read == -1) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                break; // ✅ 核心：内核数据已被彻底抽干，可以安心去解析了！
+                break; // 核心：内核数据已被彻底抽干，可以安心去解析了！
             }
             return; // 发生了真正的致命错误，直接退出
         } else if (bytes_read == 0) {
@@ -89,7 +102,7 @@ void http_conn::process() {
     if (m_read_idx == 0) return; // 什么都没读到，直接溜
 
     // ==========================================
-    // 🔪 第二刀：循环处理缓冲区里的所有请求 (防 Pipeline 陷阱)
+    // 第二刀：循环处理缓冲区里的所有请求 (防 Pipeline 陷阱)
     // ==========================================
     int start_index = 0;
 
@@ -111,12 +124,13 @@ void http_conn::process() {
 
                 do_request(m_url);  // 处理当前这个请求，发文件！
 
-                // 【极其关键的修改】：绝对不能在这里 return！
+                // 绝对不能在这里 return！
                 // 因为 m_read_buf 后面可能还跟着 wrk 发来的下一个请求！
                 // 我们必须重置状态，继续下一轮 while 循环剥洋葱！
                 m_check_state = REQUESTLINE; 
                 m_content_length = 0;
                 m_url = nullptr; // 只需要把它置空就行了！
+                m_is_post = false;
                 
                 // 如果是 POST，还需要把 start_index 往后跳过 Body 的长度，以免下一轮解析出错
                 if (m_post_data != nullptr) {
@@ -179,7 +193,6 @@ void http_conn::parse_request_line(char* text) {
 }
 
 void http_conn::parse_headers(char* text) {
-    // 【新增】如果是 Content-Length 字段，把长度数字扣出来
     if (strncasecmp(text, "Content-Length:", 15) == 0) {
         text += 15;
         // 跳过空格
@@ -191,15 +204,25 @@ void http_conn::parse_headers(char* text) {
         text += 11;
         text += strspn(text, " \t"); // 跳过冒号后面的空格
         
-        // 如果浏览器发了 keep-alive，我们就记在小本本上
         if (strncasecmp(text, "keep-alive", 10) == 0) {
             m_is_keep_alive = true;
+        }
+    }
+
+    // 查验客人有没有戴防伪手环
+    else if (strncasecmp(text, "Authorization:", 14) == 0) {
+        text += 14;
+        text += strspn(text, " \t"); // 跳过空格
+        if (strncasecmp(text, "Bearer ", 7) == 0) {
+            m_jwt_token = text + 7; // 拿到真正的 Token 字符串！
         }
     }
 }
 
 void http_conn::do_request(const char* url) {
-    // 【新增】拦截 POST 登录请求
+    bytes_have_send = 0;
+
+    // 【拦截：动态登录接口】
     if (m_is_post && strcmp(url, "/login") == 0) {
         // LOG_INFO("[API 请求] 尝试登录，接收到数据: %s ", (m_post_data ? m_post_data : "无"));
         
@@ -208,21 +231,28 @@ void http_conn::do_request(const char* url) {
         // sscanf 是 C 语言神器，按照格式提取字符串
         if (m_post_data) {
             sscanf(m_post_data, "user=%[^&]&password=%s", name, pwd);
+            printf("[Debug] 收到原始数据: %s | 解析出账号: '%s', 密码: '%s'\n", m_post_data, name, pwd);
         }
 
         // 调用刚才写的 MySQL 校验函数！
         bool login_success = verify_login(name, pwd);
 
         // 返回 JSON 给前端
-        char response_body[512];
+        char response_body[1024];
         if (login_success) {
-            sprintf(response_body, "{\"status\": \"success\", \"message\": \"欢迎回来, %s大师!\"}", name);
+            // 召唤 OpenSSL，生成绝对防伪的 JWT 手环
+            std::string token = JWTUtil::Generate(name);
+            
+            // 把手环塞进 JSON 里发给客户端
+            sprintf(response_body, 
+                    "{\"status\": \"success\", \"message\": \"欢迎回来, %s大师!\", \"token\": \"%s\"}", 
+                    name, token.c_str());
         } else {
             sprintf(response_body, "{\"status\": \"error\", \"message\": \"账号或密码错误!\"}");
         }
 
-        char header[512];
-        sprintf(header, 
+       // 把响应头写入专门的 write_buf
+        m_write_idx = sprintf(m_write_buf, 
                 "HTTP/1.1 200 OK\r\n"
                 "Connection: %s\r\n"
                 "Content-Type: application/json; charset=utf-8\r\n"
@@ -230,52 +260,72 @@ void http_conn::do_request(const char* url) {
                 (m_is_keep_alive ? "keep-alive" : "close"), 
                 strlen(response_body));
 
-        send(m_sockfd, header, strlen(header), 0);
-        send(m_sockfd, response_body, strlen(response_body), 0);
+        // 身体紧跟在头部后面
+        strcpy(m_write_buf + m_write_idx, response_body);
+        m_write_idx += strlen(response_body);
+
+        // 记账：这单只有 1 块内存（全在 m_write_buf 里）
+        m_iv[0].iov_base = m_write_buf;
+        m_iv[0].iov_len = m_write_idx;
+        m_iv_count = 1;
+        bytes_to_send = m_write_idx;
         return; 
     }
 
 
-    // 【新增逻辑】API 路由拦截 (Controller)
-    // 拦截对 "/api/hello" 的访问，直接返回动态生成的 JSON 数据
+    // ==========================================
+    // 【拦截：受 JWT 保护的内部 API 路由】
+    // ==========================================
     if (strcmp(url, "/api/hello") == 0) {
-        // LOG_INFO("[API 请求] 访问了 hello 接口，携带参数: %s ", (m_query_string ? m_query_string : "无"));
+        std::string current_user = "Stranger";
+        char response_body[512];
+        int status_code = 200;
+        const char* status_text = "OK";
 
-        // 提取参数内容 (简单的字符串查找，实际项目会用正则或专门的解析库)
-        const char* default_name = "Stranger";
-        if (m_query_string && strncmp(m_query_string, "name=", 5) == 0) {
-            default_name = m_query_string + 5; // 跳过 "name="，拿到后面的值
+        // 看看客人带没带手环？
+        if (m_jwt_token == nullptr) {
+            status_code = 401;
+            status_text = "Unauthorized";
+            sprintf(response_body, "{\"status\": \"error\", \"message\": \"Access Denied: 没戴 VIP 手环，给我出去！\"}");
+        } 
+        // 带了手环？拿防伪印章验一验！
+        else if (!JWTUtil::Verify(m_jwt_token, current_user)) {
+            status_code = 401;
+            status_text = "Unauthorized";
+            sprintf(response_body, "{\"status\": \"error\", \"message\": \"Access Denied: 手环是假的，或者是前朝的剑，抓起来！\"}");
+        } 
+        // 验票完美通过！
+        else {
+            // 此时 current_user 已经安全地被 OpenSSL 从手环里提取出来了！
+            sprintf(response_body, "{\"status\": \"success\", \"message\": \"尊贵的 %s, 欢迎进入机密系统!\"}", current_user.c_str());
         }
 
-        // 动态拼装 JSON 正文
-        char response_body[512];
-        sprintf(response_body, "{\"status\": \"success\", \"message\": \"Hello, %s! Welcome to Anhui Engineering University Server.\"}", default_name);
-
-        // 拼装 HTTP 响应头 (注意 Content-Type 变成了 application/json)
-        char header[512];
-        sprintf(header, 
-                "HTTP/1.1 200 OK\r\n"
+        // 动态拼装响应头（注意状态码是动态的）
+        m_write_idx = sprintf(m_write_buf, 
+                "HTTP/1.1 %d %s\r\n"
                 "Connection: %s\r\n"
                 "Content-Type: application/json; charset=utf-8\r\n"
-                "Content-Length: %zu\r\n"
-                "\r\n", 
+                "Content-Length: %zu\r\n\r\n", 
+                status_code, status_text,
                 (m_is_keep_alive ? "keep-alive" : "close"), 
                 strlen(response_body));
 
-        // 直接发送内存里生成的动态数据，然后 return！不再往下走 mmap 静态文件逻辑
-        send(m_sockfd, header, strlen(header), 0);
-        send(m_sockfd, response_body, strlen(response_body), 0);
+        strcpy(m_write_buf + m_write_idx, response_body);
+        m_write_idx += strlen(response_body);
+
+        m_iv[0].iov_base = m_write_buf;
+        m_iv[0].iov_len = m_write_idx;
+        m_iv_count = 1;
+        bytes_to_send = m_write_idx;
+        
         return; 
     }
-
     char path[256];
     sprintf(path, "./resources%s", url); 
 
     struct stat file_stat;
     
-    // ---------------------------------------------------------
-    // 第一步：查户口。如果 stat 返回 < 0，说明文件在硬盘上不存在
-    // ---------------------------------------------------------
+    // 如果文件不存在 (404)
     if (stat(path, &file_stat) < 0) {
         // LOG_ERROR("[404 Not Found] 找不到文件: %s ", path);
         
@@ -285,60 +335,108 @@ void http_conn::do_request(const char* url) {
             "<body><h1 style='color:red;'>404 Not Found</h1>"
             "<p>对不起，您访问的页面被外星人劫持了！</p></body></html>";
 
-        char header[512];
-        // 组装 404 响应头：注意状态码变成了 404 Not Found
-        sprintf(header, 
+        m_write_idx = sprintf(m_write_buf, 
                 "HTTP/1.1 404 Not Found\r\n"
+                "Connection: %s\r\n"
                 "Content-Type: text/html; charset=utf-8\r\n"
-                "Content-Length: %zu\r\n"
-                "\r\n", strlen(error_body));
+                "Content-Length: %zu\r\n\r\n", 
+                (m_is_keep_alive ? "keep-alive" : "close"),
+                strlen(error_body));
 
-        // 先发头部，再发正文，然后直接 return 结束任务
-        send(m_sockfd, header, strlen(header), 0);
-        send(m_sockfd, error_body, strlen(error_body), 0);
-        return; 
-    }
+        strcpy(m_write_buf + m_write_idx, error_body);
+        m_write_idx += strlen(error_body);
 
-    // ---------------------------------------------------------
-    // 第二步：文件存在！获取它的正确类型
-    // ---------------------------------------------------------
+        m_iv[0].iov_base = m_write_buf;
+        m_iv[0].iov_len = m_write_idx;
+        m_iv_count = 1;
+        bytes_to_send = m_write_idx;
+        return;
+
+    // 如果文件存在，使用 mmap 零拷贝
     const char* file_type = get_content_type(path);
-
-    // ---------------------------------------------------------
-    // 第三步：mmap 内存映射 (零拷贝)
-    // ---------------------------------------------------------
     int fd = open(path, O_RDONLY);
-    if (fd < 0) {
-        return; // 打不开文件就直接溜，别往下走！
-    }
-    char* file_address = (char*)mmap(0, file_stat.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (fd < 0) return;
+
+    m_file_size = file_stat.st_size;
+    m_file_address = (char*)mmap(0, m_file_size, PROT_READ, MAP_PRIVATE, fd, 0);
     close(fd); 
 
-    // 🚨 终极防弹衣：如果内存映射失败，绝对不能发！
-    if (file_address == (void*)-1) { 
+    // 如果内存映射失败，绝对不能发！
+    if (m_file_address == (void*)-1) {
+        m_file_address = nullptr;
         return;
     }
 
-    // ---------------------------------------------------------
-    // 第四步：组装 200 OK 响应头，并发送
-    // ---------------------------------------------------------
-    char header[512];
-    sprintf(header, 
+   // 头部写入 m_write_buf
+    m_write_idx = sprintf(m_write_buf, 
             "HTTP/1.1 200 OK\r\n"
-            "Connection: %s\r\n"  // 【新增这一行模板】
+            "Connection: %s\r\n"
             "Content-Type: %s\r\n"
-            "Content-Length: %ld\r\n"
-            "\r\n", 
-            (m_is_keep_alive ? "keep-alive" : "close"), // 【新增参数：根据小本本动态填入】
-            file_type, file_stat.st_size);
+            "Content-Length: %ld\r\n\r\n", 
+            (m_is_keep_alive ? "keep-alive" : "close"), 
+            file_type, m_file_size);
             
-    send(m_sockfd, header, strlen(header), 0);
+    // 记账：这单有 2 块内存（一块头，一块 mmap）
+    m_iv[0].iov_base = m_write_buf;
+    m_iv[0].iov_len = m_write_idx;
+    
+    m_iv[1].iov_base = m_file_address;
+    m_iv[1].iov_len = m_file_size;
+    
+    m_iv_count = 2;
+    bytes_to_send = m_write_idx + m_file_size;
+    }
+}
 
-    // ---------------------------------------------------------
-    // 第五步：发送文件本体，并释放内存
-    // ---------------------------------------------------------
-    send(m_sockfd, file_address, file_stat.st_size, 0);
-    munmap(file_address, file_stat.st_size); // 极其重要：防止内存泄漏
+// 支持断点续传的 write 状态机
+bool http_conn::write() {
+    int temp = 0;
+
+    // 如果本来就没东西发，任务完成！
+    if (bytes_to_send == 0) {
+        return true; 
+    }
+
+    // 只要网卡没满，就死循环疯狂发！
+    while (1) {
+        // writev：同时把 m_iv 里的多块内存按顺序发出去
+        temp = writev(m_sockfd, m_iv, m_iv_count);
+        
+        if (temp <= -1) {
+            // 网卡喊停了！
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // 保留一切现状，返回 true (告诉主线程不要关连接，等下次唤醒)
+                return true; 
+            }
+            // 发生真正的错误 (比如对面拔网线了)，安全释放内存并告辞
+            unmap(); 
+            return false; 
+        }
+
+        bytes_have_send += temp;
+        bytes_to_send -= temp;
+
+        // 最烧脑的指针平移：计算下一次该从哪里开始发
+        if (bytes_have_send >= m_write_idx) {
+            // 情况 A：头部已经全发完了！
+            m_iv[0].iov_len = 0; 
+            if (m_iv_count == 2) { // 如果有文件身体，平移身体的指针
+                m_iv[1].iov_base = m_file_address + (bytes_have_send - m_write_idx);
+                m_iv[1].iov_len = bytes_to_send;
+            }
+        } else {
+            // 情况 B：头部还没发完
+            m_iv[0].iov_base = m_write_buf + bytes_have_send;
+            m_iv[0].iov_len = m_write_idx - bytes_have_send;
+        }
+
+        // 全部发完了！
+        if (bytes_to_send <= 0) {
+            unmap(); // 卸载货车 (释放 mmap)
+            // 如果是短连接，返回 false 让主线程拔网线；长连接返回 true 继续听命
+            return m_is_keep_alive; 
+        }
+    }
 }
 
 bool http_conn::verify_login(const char* name, const char* pwd) {

@@ -13,6 +13,7 @@ RUN apt-get update && apt-get install -y \
     make \
     libmysqlclient-dev \
     libhiredis-dev \
+    libssl-dev \
     wget \
     && rm -rf /var/lib/apt/lists/*
 

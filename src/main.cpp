@@ -40,20 +40,20 @@ void add_fd_to_epoll(int epoll_fd, int fd, bool is_client) {
 int main() {
     signal(SIGPIPE, SIG_IGN);
 
-    // 【新增这行神仙代码】：在程序刚苏醒的第一时间启动异步日志！
+    // 在程序刚苏醒的第一时间启动异步日志！
     // 参数1：日志文件名  参数2：阻塞队列最大长度（大于0代表开启异步传菜员模式）
     // Log::Instance()->init("./tiny_server.log", 1024);
 
     // LOG_INFO("\n"); 
     // LOG_INFO("==================================================");
-    // LOG_INFO("========== 🚀 Tiny Server Rebooting... ==========");
+    // LOG_INFO("========== Tiny Server Rebooting... ==========");
     // LOG_INFO("==================================================");
     // LOG_INFO("异步日志系统启动成功，大管家已就位！");
 
     SqlConnPool::Instance()->init("host.docker.internal", 3306, "webuser", "123456", "tiny_server", 10);
 
     ThreadPool pool(16); 
-    HeapTimer timer; // 【新增】创建一个无情的监工
+    HeapTimer timer; // 创建一个无情的监工
 
     http_conn* users = new http_conn[MAX_FD];
 
@@ -77,7 +77,7 @@ int main() {
     epoll_event events[MAX_EVENTS]; 
 
     while (true) {
-        // 【核心修改】每次循环前，问一下定时器：最近的一个死期还有多久？
+        // 每次循环前，问一下定时器：最近的一个死期还有多久？
         // 如果返回 -1，说明目前没人连着，epoll 就可以安心睡大觉死等。
         int time_ms = timer.getNextTick();
         
@@ -111,7 +111,6 @@ int main() {
                     add_fd_to_epoll(epoll_fd, client_fd, true);
                     // LOG_INFO("[Epoll] 新客人连入: %d", client_fd);
                     
-                    // 登记生死簿 (这里我把你原来的日志注释掉了，保持静音加速！)
                     timer.add(client_fd, TIMEOUT_MS, [client_fd, epoll_fd]() {
                         // LOG_INFO("[无情监工] 客户端: %d 挂机超过15秒，拔网线！", client_fd);
                         epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd, 0); 
@@ -120,9 +119,8 @@ int main() {
                 }
             } 
 
-            // 情况 B：老客人发请求了！
+            // 情况 B：客人发请求来了 (EPOLLIN)
             else if (events[i].events & EPOLLIN) {
-                // 【新增】客人有动静了，表现很好，给他“续命” 15 秒！
                 // 再次调用 add 时，定时器内部会找到它并自动下沉/上浮调整堆的位置
                 timer.add(sockfd, TIMEOUT_MS, [sockfd, epoll_fd]() {
                     // LOG_INFO("[无情监工] 客户端: %d 挂机超过15秒，拔网线！", sockfd);
@@ -132,21 +130,43 @@ int main() {
 
                 // 把处理任务丢给线程池
                 pool.addTask([sockfd, epoll_fd, users] {
-                    users[sockfd].process(); // 这个管家自带持续的 read_buf，绝不失忆！
+                    users[sockfd].process(); // 1. 解析请求并装配好小本本
                     
-                    // 【修改】：核心裁决逻辑！查小本本！
-                    if (users[sockfd].is_keep_alive()) {
+                    // 2. 无论有没有解析出数据，立刻强制切换到发货模式 (EPOLLOUT)！
+                    epoll_event event;
+                    event.data.fd = sockfd;
+                    event.events = EPOLLOUT | EPOLLET | EPOLLONESHOT;
+                    epoll_ctl(epoll_fd, EPOLL_CTL_MOD, sockfd, &event);
+                });
+            }
+
+            // 情况 C：网卡空闲了，催我们发货！(EPOLLOUT)
+            else if (events[i].events & EPOLLOUT) {
+                timer.add(sockfd, TIMEOUT_MS, [sockfd, epoll_fd]() {
+                    // LOG_INFO("[无情监工] 客户端: %d 挂机超过15秒，拔网线！", sockfd);
+                    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, sockfd, 0);
+                    close(sockfd);
+                });
+                
+                pool.addTask([sockfd, epoll_fd, users] {
+                    bool keep_alive = users[sockfd].write(); // 开始干苦力发货！
+                    
+                    if (keep_alive) {
                         epoll_event event;
                         event.data.fd = sockfd;
-                        event.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
+                        
+                        if (users[sockfd].get_bytes_to_send() == 0) {
+                            // 货全发完了，恢复到接客模式，等客人下一次发消息
+                            event.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
+                        } else {
+                            // 货没发完被网卡弹回来了，继续保持发货模式死等
+                            event.events = EPOLLOUT | EPOLLET | EPOLLONESHOT;
+                        }
                         epoll_ctl(epoll_fd, EPOLL_CTL_MOD, sockfd, &event);
-                        // LOG_INFO("客户端 %d 开启长连接，等待下一次请求...", sockfd);
                     } else {
-                        // 短连接：客人是一次性访问，或者不符合长连接规矩。
-                        // 绝不浪费资源，立刻、当场、马上拔网线！
+                        // 短连接或者发生严重错误，拔网线
                         epoll_ctl(epoll_fd, EPOLL_CTL_DEL, sockfd, 0); 
                         close(sockfd);
-                        // LOG_INFO("客户端 %d 短连接结束，已清理。", sockfd);
                     }
                 });
             }

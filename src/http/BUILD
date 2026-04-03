@@ -6,6 +6,7 @@ cc_library(
     deps = [
         "//src/mysql:mysql_pool_lib", 
         "//src/log:log_lib",
+        "//src/utils:jwt_util",
     ],
     linkopts = [
         "-lhiredis", 
