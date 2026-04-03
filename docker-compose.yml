@@ -1,0 +1,52 @@
+version: '3.8'
+
+services:
+  # 1. MySQL 数据库服务
+  mysql_db:
+    image: mysql:8.0
+    container_name: tiny_mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: root_password
+      MYSQL_DATABASE: tiny_server
+      MYSQL_USER: webuser
+      MYSQL_PASSWORD: 123456
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      # 如果你有初始化 SQL 脚本，可以挂载到下面这个目录，它会自动执行
+      # - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - tiny_network
+
+  # 2. Redis 缓存服务
+  redis_cache:
+    image: redis:latest
+    container_name: tiny_redis
+    ports:
+      - "6379:6379"
+    networks:
+      - tiny_network
+
+  # 3. 你的 C++ 高性能服务器
+  web_server:
+    build: .
+    container_name: my_server
+    ports:
+      - "8080:8080"
+    # 核心黑科技：让容器内部依然能通过 host.docker.internal 访问宿主机或相互访问
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - mysql_db
+      - redis_cache
+    networks:
+      - tiny_network
+    restart: always
+
+networks:
+  tiny_network:
+    driver: bridge
+
+volumes:
+  mysql_data:
