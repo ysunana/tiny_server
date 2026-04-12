@@ -5,38 +5,53 @@ http_conn::http_conn() {
     m_sockfd = -1; // -1 代表这个长工目前闲置，没有接待客人
     m_url = nullptr;
     m_post_data = nullptr;
-    m_file_address = nullptr;
     // 其他指针也置空即可，不需要在这里 memset，因为没人用
 }
 
 void http_conn::init(int fd) {
     m_sockfd = fd;
+    
+    // 必须先判断并关闭旧句柄，再置为 -1
+    if (m_file_fd > -1) {
+        close(m_file_fd);
+        m_file_fd = -1;
+    }
+
+    // 设置端口复用 (推荐加上，防止高并发下 TIME_WAIT 占用端口)
+    int reuse = 1;
+    setsockopt(m_sockfd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+
+    // 调用无参版 init，完成内部缓冲区的打扫
+    init();
+}
+
+void http_conn::init() {
+    // 1. 状态机与标志位重置
     m_check_state = REQUESTLINE;
     m_is_post = false;
     m_content_length = 0;
     m_is_keep_alive = false;
     
+    // 2. 解析游标和指针彻底归零
     m_read_idx = 0;
     m_url = nullptr;
     m_post_data = nullptr;
     m_jwt_token = nullptr;
     
-    // 重置发货记账本
+    // 3. 重置发货记账本
     m_write_idx = 0;
     bytes_to_send = 0;
     bytes_have_send = 0;
-    unmap(); // 清理上一任客人可能的残留
-    memset(m_write_buf, '\0', WRITE_BUFFER_SIZE);
-    
-    memset(m_read_buf, '\0', READ_BUFFER_SIZE);
-}
 
-// 释放内存的专属函数
-void http_conn::unmap() {
-    if (m_file_address) {
-        munmap(m_file_address, m_file_size);
-        m_file_address = nullptr;
+    // 4. 发完文件后，确保文件句柄被关闭
+    if (m_file_fd > -1) {
+        close(m_file_fd);
+        m_file_fd = -1;
     }
+
+    // 5. 物理清空缓冲区
+    memset(m_write_buf, '\0', WRITE_BUFFER_SIZE);
+    memset(m_read_buf, '\0', READ_BUFFER_SIZE);
 }
 
 // 切割一行的工具函数
@@ -224,7 +239,7 @@ void http_conn::do_request(const char* url) {
 
     // 【拦截：动态登录接口】
     if (m_is_post && strcmp(url, "/login") == 0) {
-        // LOG_INFO("[API 请求] 尝试登录，接收到数据: %s ", (m_post_data ? m_post_data : "无"));
+        LOG_INFO("[API 请求] 尝试登录，接收到数据: %s ", (m_post_data ? m_post_data : "无"));
         
         // 简单暴力地解析 "user=xxx&password=yyy" (实际项目会用正则或专门的分割函数)
         char name[50] = {0}, pwd[50] = {0};
@@ -263,11 +278,6 @@ void http_conn::do_request(const char* url) {
         // 身体紧跟在头部后面
         strcpy(m_write_buf + m_write_idx, response_body);
         m_write_idx += strlen(response_body);
-
-        // 记账：这单只有 1 块内存（全在 m_write_buf 里）
-        m_iv[0].iov_base = m_write_buf;
-        m_iv[0].iov_len = m_write_idx;
-        m_iv_count = 1;
         bytes_to_send = m_write_idx;
         return; 
     }
@@ -312,10 +322,6 @@ void http_conn::do_request(const char* url) {
 
         strcpy(m_write_buf + m_write_idx, response_body);
         m_write_idx += strlen(response_body);
-
-        m_iv[0].iov_base = m_write_buf;
-        m_iv[0].iov_len = m_write_idx;
-        m_iv_count = 1;
         bytes_to_send = m_write_idx;
         
         return; 
@@ -327,7 +333,7 @@ void http_conn::do_request(const char* url) {
     
     // 如果文件不存在 (404)
     if (stat(path, &file_stat) < 0) {
-        // LOG_ERROR("[404 Not Found] 找不到文件: %s ", path);
+        LOG_ERROR("[404 Not Found] 找不到文件: %s ", path);
         
         // 我们手写一段简陋的 HTML 作为 404 错误页面的正文
         const char* error_body = 
@@ -345,27 +351,16 @@ void http_conn::do_request(const char* url) {
 
         strcpy(m_write_buf + m_write_idx, error_body);
         m_write_idx += strlen(error_body);
-
-        m_iv[0].iov_base = m_write_buf;
-        m_iv[0].iov_len = m_write_idx;
-        m_iv_count = 1;
         bytes_to_send = m_write_idx;
         return;
+    }
 
-    // 如果文件存在，使用 mmap 零拷贝
+    // 如果文件存在，准备用 sendfile 发送
     const char* file_type = get_content_type(path);
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) return;
+    m_file_fd = open(path, O_RDONLY);
+    if (m_file_fd < 0) return;
 
     m_file_size = file_stat.st_size;
-    m_file_address = (char*)mmap(0, m_file_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    close(fd); 
-
-    // 如果内存映射失败，绝对不能发！
-    if (m_file_address == (void*)-1) {
-        m_file_address = nullptr;
-        return;
-    }
 
    // 头部写入 m_write_buf
     m_write_idx = sprintf(m_write_buf, 
@@ -375,68 +370,84 @@ void http_conn::do_request(const char* url) {
             "Content-Length: %ld\r\n\r\n", 
             (m_is_keep_alive ? "keep-alive" : "close"), 
             file_type, m_file_size);
-            
-    // 记账：这单有 2 块内存（一块头，一块 mmap）
-    m_iv[0].iov_base = m_write_buf;
-    m_iv[0].iov_len = m_write_idx;
-    
-    m_iv[1].iov_base = m_file_address;
-    m_iv[1].iov_len = m_file_size;
-    
-    m_iv_count = 2;
+
     bytes_to_send = m_write_idx + m_file_size;
-    }
+    
 }
 
-// 支持断点续传的 write 状态机
 bool http_conn::write() {
     int temp = 0;
 
-    // 如果本来就没东西发，任务完成！
     if (bytes_to_send == 0) {
         return true; 
     }
 
-    // 只要网卡没满，就死循环疯狂发！
     while (1) {
-        // writev：同时把 m_iv 里的多块内存按顺序发出去
-        temp = writev(m_sockfd, m_iv, m_iv_count);
-        
+        // 1. 如果头部还没发完，先用普通的 send 发送 m_write_buf 里的头部
+        if (bytes_have_send < m_write_idx) {
+            temp = send(m_sockfd, m_write_buf + bytes_have_send, m_write_idx - bytes_have_send, 0);
+        } 
+        // 2. 头部发完了，直接上 sendfile 大杀器，把磁盘文件怼进网卡！
+        else {
+            // 计算当前该从文件的哪个位置开始读
+            off_t offset = bytes_have_send - m_write_idx; 
+            temp = sendfile(m_sockfd, m_file_fd, &offset, bytes_to_send);
+        }
+
+        // ---------------- 处理错误 ----------------
         if (temp <= -1) {
-            // 网卡喊停了！
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                // 保留一切现状，返回 true (告诉主线程不要关连接，等下次唤醒)
-                return true; 
+                return true; // 网卡满了，等下次 EPOLLOUT 唤醒
             }
-            // 发生真正的错误 (比如对面拔网线了)，安全释放内存并告辞
-            unmap(); 
+            // 发生真错误，关门大吉
+            if (m_file_fd > -1) { close(m_file_fd); m_file_fd = -1; }
             return false; 
         }
 
+        // ---------------- 推进进度 ----------------
         bytes_have_send += temp;
         bytes_to_send -= temp;
 
-        // 最烧脑的指针平移：计算下一次该从哪里开始发
-        if (bytes_have_send >= m_write_idx) {
-            // 情况 A：头部已经全发完了！
-            m_iv[0].iov_len = 0; 
-            if (m_iv_count == 2) { // 如果有文件身体，平移身体的指针
-                m_iv[1].iov_base = m_file_address + (bytes_have_send - m_write_idx);
-                m_iv[1].iov_len = bytes_to_send;
-            }
-        } else {
-            // 情况 B：头部还没发完
-            m_iv[0].iov_base = m_write_buf + bytes_have_send;
-            m_iv[0].iov_len = m_write_idx - bytes_have_send;
-        }
-
-        // 全部发完了！
+        // ---------------- 发送完毕 ----------------
         if (bytes_to_send <= 0) {
-            unmap(); // 卸载货车 (释放 mmap)
-            // 如果是短连接，返回 false 让主线程拔网线；长连接返回 true 继续听命
+            if (m_file_fd > -1) { close(m_file_fd); m_file_fd = -1; } // 关掉文件句柄
             return m_is_keep_alive; 
         }
     }
+}
+
+bool http_conn::read() {
+    // 缓冲区满了，没法读了
+    if (m_read_idx >= READ_BUFFER_SIZE) {
+        return false;
+    }
+
+    int bytes_read = 0;
+    
+    // 疯狂榨干网卡的死循环
+    while (true) {
+        // 从 socket 里读数据，放进 m_read_buf 里
+        bytes_read = recv(m_sockfd, m_read_buf + m_read_idx, READ_BUFFER_SIZE - m_read_idx, 0);
+
+        if (bytes_read == -1) {
+            // 如果底层错误码是 EAGAIN 或 EWOULDBLOCK，说明网卡已经被我们彻底榨干了！
+            // 这不是真错误，而是“正常读完”的标志，直接退出循环！
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                break;
+            }
+            // 发生真正的错误，返回 false 让外部清理
+            return false; 
+        } else if (bytes_read == 0) {
+            // 对面正常拔了网线 (发送了 FIN 包)
+            return false; 
+        }
+
+        // 把读取位置的指针往后推
+        m_read_idx += bytes_read;
+    }
+    
+    LOG_INFO("读取到了 %d 字节的数据", m_read_idx);
+    return true;
 }
 
 bool http_conn::verify_login(const char* name, const char* pwd) {
@@ -454,7 +465,10 @@ bool http_conn::verify_login(const char* name, const char* pwd) {
             redisFree(redis_conn); // 清理死掉的旧连接
             redis_conn = nullptr;
         }
-        redis_conn = redisConnect("host.docker.internal", 6379);
+        std::string redis_host = Config::Instance()->GetString("redis_host", "tiny_redis");
+        int redis_port = Config::Instance()->GetInt("redis_port", 6379);
+        
+        redis_conn = redisConnect(redis_host.c_str(), redis_port);
     }
     
     if (redis_conn != NULL && !redis_conn->err) {
@@ -466,7 +480,7 @@ bool http_conn::verify_login(const char* name, const char* pwd) {
             // 根本不需要去烦 MySQL，直接在内存里比对密码！
             bool is_match = (strcmp(reply->str, pwd) == 0);
             
-            // LOG_INFO("[Redis] 命中缓存！账号: %s", name); // 压测时记得保持注释
+            LOG_INFO("[Redis] 命中缓存！账号: %s", name); 
             
             freeReplyObject(reply);
             return is_match; // 光速返回！
@@ -477,7 +491,7 @@ bool http_conn::verify_login(const char* name, const char* pwd) {
     // ==========================================
     // 第二道防线：Redis 没找到，只能去查 MySQL (磁盘查找)
     // ==========================================
-    // LOG_INFO("[Redis] 未命中，去 MySQL 查档案...");
+    LOG_INFO("[Redis] 未命中，去 MySQL 查档案...");
 
     MYSQL* mysql = nullptr;
     // RAII 机制：自动从单例池中获取连接，函数结束时自动归还！
@@ -501,16 +515,16 @@ bool http_conn::verify_login(const char* name, const char* pwd) {
 
                     if (redis_conn != NULL && !redis_conn->err) {
                         // SET 账号 密码
-                        redisReply *set_reply = (redisReply *)redisCommand(redis_conn, "SET %s %s", name, row[0]);
+                        redisReply *set_reply = (redisReply *)redisCommand(redis_conn, "SETEX %s 1800 %s", name, row[0]);
                         if (set_reply) freeReplyObject(set_reply);
-                        // LOG_INFO("[Redis] 档案已同步至内存便利贴！");
+                        LOG_INFO("[Redis] 档案已同步至内存，有效期 30 分钟！");
                     }
 
                 } else {
-                    // LOG_ERROR("[DB] 密码错误！");
+                    LOG_ERROR("[DB] 密码错误！");
                 }
             } else {
-                // LOG_ERROR("[DB] 用户不存在！");
+                LOG_ERROR("[DB] 用户不存在！");
             }
 
             // 释放结果集内存 (重要，防内存泄露)

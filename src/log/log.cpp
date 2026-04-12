@@ -48,8 +48,10 @@ void Log::AsyncWrite_() {
     while(deq_->pop(str)) { // 如果桌上没菜，他就会在这里睡着（被条件变量阻塞）
         std::lock_guard<std::mutex> locker(mtx_);
         // 只要拿到菜，就立刻写进磁盘！
-        fputs(str.c_str(), fp_);
-        fflush(fp_);
+        if (fp_ != nullptr) {
+            fputs(str.c_str(), fp_);
+            fflush(fp_);
+        }
     }
 }
 
@@ -90,6 +92,10 @@ void Log::write(int level, const char *format, ...) {
 
     std::string final_log_str = log_str;
 
+    // 强行同步输出到终端控制台，让 Docker 截获
+    printf("%s", final_log_str.c_str());
+    fflush(stdout);
+
     if(isAsync_ && deq_ && !deq_->full()) {
         // 【高光时刻】：如果是异步模式，且桌子没满，直接扔给大长桌！
         // 扔完厨师直接就走人了，绝对不在这里等磁盘的龟速 I/O！
@@ -97,7 +103,9 @@ void Log::write(int level, const char *format, ...) {
     } else {
         // 如果没开异步，或者桌子满了，厨师只好自己苦逼地去写磁盘了
         std::lock_guard<std::mutex> locker(mtx_);
-        fputs(final_log_str.c_str(), fp_);
+        if (fp_ != nullptr) {
+            fputs(final_log_str.c_str(), fp_);
+        }
     }
 }
 

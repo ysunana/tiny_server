@@ -24,11 +24,13 @@ RUN wget https://mirrors.huaweicloud.com/bazel/6.4.0/bazel-6.4.0-linux-x86_64 -O
 # 6. 搬运代码
 COPY . /app
 
+RUN mkdir -p /app/log
+
 RUN echo 'load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")' >> WORKSPACE \
     && echo 'http_archive(name = "rules_cc", urls = ["https://mirror.bazel.build/github.com/bazelbuild/rules_cc/releases/download/0.0.2/rules_cc-0.0.2.tar.gz", "https://ghproxy.net/https://github.com/bazelbuild/rules_cc/releases/download/0.0.2/rules_cc-0.0.2.tar.gz"])' >> WORKSPACE
 
 # 7. 锻造武器 (明确指定只执行编译，绝不运行！)
-RUN make build
+RUN make
 
 # 8. 暴露端口
 EXPOSE 8080

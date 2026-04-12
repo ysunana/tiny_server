@@ -44,14 +44,11 @@ private:
     std::mutex mtx_;             // 保护 fp_ 和内部状态的锁
 };
 
-// =========================================================================
-// 【高能预警】：全网最爱的“对讲机” (宏定义)
-// ##__VA_ARGS__ 是 C++ 的黑魔法，用来支持可变参数（就像 printf 一样）
-// =========================================================================
-#define LOG_DEBUG(format, ...) Log::Instance()->write(0, format, ##__VA_ARGS__)
-// #define LOG_INFO(format, ...)  Log::Instance()->write(1, format, ##__VA_ARGS__)
-#define LOG_INFO(format, ...) do {} while(0);
-#define LOG_WARN(format, ...)  Log::Instance()->write(2, format, ##__VA_ARGS__)
-#define LOG_ERROR(format, ...) Log::Instance()->write(3, format, ##__VA_ARGS__)
+extern int GLOBAL_LOG_LEVEL; 
+
+#define LOG_DEBUG(format, ...) if(0 >= GLOBAL_LOG_LEVEL) { Log::Instance()->write(0, format, ##__VA_ARGS__); }
+#define LOG_INFO(format, ...)  if(1 >= GLOBAL_LOG_LEVEL) { Log::Instance()->write(1, format, ##__VA_ARGS__); }
+#define LOG_WARN(format, ...)  if(2 >= GLOBAL_LOG_LEVEL) { Log::Instance()->write(2, format, ##__VA_ARGS__); }
+#define LOG_ERROR(format, ...) if(3 >= GLOBAL_LOG_LEVEL) { Log::Instance()->write(3, format, ##__VA_ARGS__); }
 
 #endif // LOG_H

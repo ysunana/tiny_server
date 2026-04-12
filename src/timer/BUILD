@@ -1,6 +1,6 @@
 cc_library(
     name = "timer_lib",
-    srcs = ["heaptimer.cpp"],
-    hdrs = ["heaptimer.h"],
+    srcs = ["lru_timer.cpp"],
+    hdrs = ["lru_timer.h"],
     visibility = ["//visibility:public"],
 )

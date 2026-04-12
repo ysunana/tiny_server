@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="zh">
+
+<head>
+    <meta charset="UTF-8">
+    <title>TinyServer V12 登录系统</title>
+    <style>
+        body {
+            font-family: Arial;
+            padding: 50px;
+            background: #f4f4f4;
+        }
+
+        .box {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            width: 300px;
+            box-shadow: 0 0 10px rgba(0, 0, 0, 0.1);
+        }
+
+        input {
+            width: 90%;
+            padding: 8px;
+            margin: 10px 0;
+        }
+
+        button {
+            width: 100%;
+            padding: 10px;
+            background: #28a745;
+            color: white;
+            border: none;
+            cursor: pointer;
+            margin-top: 10px;
+        }
+
+        button.api-btn {
+            background: #007bff;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="box">
+        <h2>🚀 V12 战车登录</h2>
+        <input type="text" id="user" value="webuser" placeholder="账号">
+        <input type="password" id="pwd" value="123456" placeholder="密码">
+        <button onclick="doLogin()">1. 登录并获取手环</button>
+        <button class="api-btn" onclick="testAPI()">2. 戴手环测试内部 API</button>
+        <p id="msg" style="color:red; font-size:14px;"></p>
+    </div>
+
+    <script>
+        // 【动作 1：发送登录请求】
+        function doLogin() {
+            let u = document.getElementById('user').value;
+            let p = document.getElementById('pwd').value;
+
+            // 构造 POST 请求，按你 C++ 里 sscanf 的格式发送：user=xxx&password=yyy
+            fetch('/login', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: `user=${u}&password=${p}`
+            })
+                .then(res => res.json())
+                .then(data => {
+                    let msgBox = document.getElementById('msg');
+                    if (data.status === 'success') {
+                        msgBox.innerText = data.message + "\n🔑 Token 已存入浏览器！";
+                        msgBox.style.color = "green";
+
+                        // 🚨 核心逻辑：把服务器发来的 JWT 手环，存进浏览器的本地仓库 (localStorage)！
+                        localStorage.setItem('my_jwt_token', data.token);
+                    } else {
+                        msgBox.innerText = "❌ 登录失败：" + data.message;
+                        msgBox.style.color = "red";
+                    }
+                });
+        }
+
+        // 【动作 2：携带手环访问机密接口】
+        function testAPI() {
+            // 🚨 核心逻辑：从浏览器的本地仓库里拿出手环
+            let token = localStorage.getItem('my_jwt_token');
+
+            fetch('/api/hello', {
+                method: 'GET',
+                // 把手环戴在 HTTP 的 Header 头上！
+                headers: { 'Authorization': 'Bearer ' + token }
+            })
+                .then(res => {
+                    if (res.status === 401) throw new Error("401 Unauthorized: 保安说你没带手环或手环是假的！");
+                    return res.json();
+                })
+                .then(data => {
+                    alert("🟢 API 响应成功！\n" + data.message);
+                })
+                .catch(err => {
+                    alert("🔴 拦截报警：\n" + err.message);
+                });
+        }
+    </script>
+</body>
+
+</html>
